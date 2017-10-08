@@ -96,7 +96,8 @@ class Trainer:
                         batch_size=256,
                         tag="",
                         use_xla=False,
-                        gpu_memory_fraction=0.95):
+                        gpu_memory_fraction=0.95,
+                        vars_on_cpu=True):
 
         self.batch_size = batch_size
 
@@ -105,14 +106,13 @@ class Trainer:
         else:
             self.num_threads = num_train_threads
 
-        self.isTest = tf.placeholder(tf.bool)
-        self.batch_idx = tf.Variable(0, trainable=False, name="batch_idx", dtype=tf.int64)
-        self.batch_idx_add_ph = tf.placeholder(tf.int64, name="batch_idx_add")
+        self.isTest            = tf.Variable(True, trainable=False, name="testPhase", dtype=tf.bool)
+        self.isTrain           = tf.Variable(False, trainable=False, name="trainPhase", dtype=tf.bool)
+        self.batch_idx         = tf.Variable(0, trainable=False, name="batch_idx", dtype=tf.int64)
+        self.batch_idx_add_ph  = tf.placeholder(tf.int64, name="batch_idx_add")
         self.refresh_batch_idx = tf.assign(self.batch_idx, tf.add(self.batch_idx, self.batch_idx_add_ph))
+        self.learning_rate     = self.lr_fun(self, self.batch_idx)
 
-        self.learning_rate = self.lr_fun(self, self.batch_idx)
-
-        vars_on_cpu = True
         last_params = tf.global_variables()
         with tf.device('/cpu:0'):
             if self.optimizer_fun != None:
@@ -121,12 +121,12 @@ class Trainer:
                 self.optimizer = tf.train.AdamOptimizer(self.learning_rate, epsilon=1e-06, beta1=0.90, use_locking=True)
             if vars_on_cpu:
                 with tf.variable_scope("", reuse=False):
-                    y_train, self.model_name = self.model_fun(self, self.train_model_input, self.isTest)
+                    y_train, self.model_name = self.model_fun(self, self.train_model_input, self.isTrain)
                     new_params = tf.global_variables()
 
         with tf.device('/gpu:0'):
             with tf.variable_scope("", reuse=vars_on_cpu):
-                y_train, self.model_name = self.model_fun(self, self.train_model_input, self.isTest)
+                y_train, self.model_name = self.model_fun(self, self.train_model_input, self.isTrain)
             if not vars_on_cpu:
                 new_params = tf.global_variables()
 
@@ -143,7 +143,7 @@ class Trainer:
             print(idx)
             with tf.device('/gpu:' + str(idx % num_gpus)):
                 with tf.variable_scope("", reuse=True):
-                    y_train, _ = self.model_fun(self, self.train_model_input, self.isTest)
+                    y_train, _ = self.model_fun(self, self.train_model_input, self.isTrain)
 
                 loss = self.get_loss(self, self.train_model_input, y_train)
 
@@ -175,8 +175,12 @@ class Trainer:
             self.assign_ops = None
             for p in self.params:
                 self.log.info(p.name)
+
         glob_init = tf.global_variables_initializer()
         loc_init = tf.local_variables_initializer()
+
+        self.train_writer = tf.summary.FileWriter("summaries/" + self.model_name, self.sess.graph)
+
         tf.get_default_graph().finalize()
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=gpu_memory_fraction, allow_growth=True)
         config = tf.ConfigProto(gpu_options=gpu_options, log_device_placement=False, allow_soft_placement=True)
@@ -208,20 +212,20 @@ class Trainer:
 
     def train(self,
               trainDataLoader,
+              load_threads_num=1,
               max_steps=1000000000,
               report_steps=200,
-              save_step=None):
+              save_step=None,
+              save_prefix=""):
         self.log.info("\n\n\n\n\n {} {}".format(self.model_name, self.sess.run(self.learning_rate)))
 
         finishing = False
 
         def load_and_enqueue(sess, enqueue_op, coord, dataLoader, tf_record):
-            # print(coord.should_stop(), finishing)
             while not coord.should_stop() and not finishing:
 
                 if tf_record:
                     sess.run(enqueue_op)
-                    # print("run")
                 else:
                     batchData_list = dataLoader.getBatch(self.batch_size)
                     feed_dict = {ph: np.copy(data) for ph, data in zip(self.train_phs, batchData_list)}
@@ -229,25 +233,24 @@ class Trainer:
 
         coord = tf.train.Coordinator()
 
-        # print("1", coord.should_stop())
-        threads = tf.train.start_queue_runners(coord=coord, sess=self.sess)
-        # while True:
-        #     print(self.sess.run(self.sizes))
-        #     time.sleep(2.0)
-        # print("1.5", coord.should_stop())
-        import threading
         if self.use_train_queue:
-            # print("2", coord.should_stop())
-            # print("queue start")
-            prefetchThread = threading.Thread(target=load_and_enqueue,
-                                              args=(self.sess,
-                                                    self.enqueue_op,
-                                                    coord,
-                                                    trainDataLoader,
-                                                    self.tf_record))
-            # print("3", coord.should_stop())
-            prefetchThread.isDaemon()
-            prefetchThread.start()
+            threads = tf.train.start_queue_runners(coord=coord, sess=self.sess)
+            import threading
+            prefetchThreads = []
+            for thread_idx in range(load_threads_num):
+                prefetchThread = threading.Thread(target=load_and_enqueue,
+                                                  args=(self.sess,
+                                                        self.enqueue_op,
+                                                        coord,
+                                                        trainDataLoader,
+                                                        self.tf_record))
+                prefetchThread.isDaemon()
+                prefetchThread.start()
+                prefetchThreads.append(prefetchThread)
+
+            for prefetchThread in prefetchThreads:
+                prefetchThread.join()
+
             print("Waiting a bit to load the queue...")
             while (self.FIFOsize - 1 > self.sess.run(self.q_size)):
                 print("Loaded {} batches".format(self.sess.run(self.q_size)))
@@ -262,11 +265,10 @@ class Trainer:
                     while (train_function.idx < report_steps and not finishing):
                         train_function.idx += 1
                         if self.use_train_queue:
-                            loss, _ = sess.run([train_loss, train_op], feed_dict={self.isTest: False})
+                            loss, _ = sess.run([train_loss, train_op])
                         else:
                             batchData_list = dataLoader.getBatch(self.batch_size)
                             feed_dict = {ph: data for ph, data in zip(self.train_phs, batchData_list)}
-                            feed_dict[self.isTest] = False
                             loss, _ = sess.run([train_loss, train_op], feed_dict=feed_dict)
 
                         train_function.losses.append(loss)
@@ -297,7 +299,7 @@ class Trainer:
                 if save_step != None:
                     idx = self.sess.run(self.batch_idx)
                     if idx % save_step < report_steps:
-                        self.save_weights("saved/weights_" + self.model_name + "_{}.npz".format(idx))
+                        self.save_weights(save_prefix + "weights_" + self.model_name + "_{}.npz".format(idx))
                 self.log.info("time for batch: {0:.4f} ms".format(1000.0 * gpu_time / float(report_steps)))
 
                 if self.validator != None:
@@ -310,14 +312,13 @@ class Trainer:
             self.save_weights("weights_" + self.model_name + ".nnz")
             import signal
             os.kill(os.getpid(), signal.SIGKILL)
-
-            for t in train_threads:
-                t.join()
-            coord.request_stop()
-            coord.join([prefetchThread])
-
-            # exit(0)
-
-        coord.request_stop()
-        coord.join([t1])
-        return
+        #
+        #     for t in train_threads:
+        #         t.join()
+        #     coord.request_stop()
+        #     coord.join(prefetchThreads)
+        #
+        #
+        # coord.request_stop()
+        # coord.join([t1])
+        # return
