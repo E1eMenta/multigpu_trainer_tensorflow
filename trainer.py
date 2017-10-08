@@ -179,8 +179,6 @@ class Trainer:
         glob_init = tf.global_variables_initializer()
         loc_init = tf.local_variables_initializer()
 
-        self.train_writer = tf.summary.FileWriter("summaries/" + self.model_name, self.sess.graph)
-
         tf.get_default_graph().finalize()
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=gpu_memory_fraction, allow_growth=True)
         config = tf.ConfigProto(gpu_options=gpu_options, log_device_placement=False, allow_soft_placement=True)
@@ -190,6 +188,9 @@ class Trainer:
         self.sess = tf.Session(config=config)
         self.sess.run(glob_init)
         self.sess.run(loc_init)
+
+        self.train_writer = tf.summary.FileWriter("summaries/" + self.model_name, self.sess.graph)
+
         if self.assign_ops is not None:
             self.sess.run(self.assign_ops)
 
@@ -247,9 +248,6 @@ class Trainer:
                 prefetchThread.isDaemon()
                 prefetchThread.start()
                 prefetchThreads.append(prefetchThread)
-
-            for prefetchThread in prefetchThreads:
-                prefetchThread.join()
 
             print("Waiting a bit to load the queue...")
             while (self.FIFOsize - 1 > self.sess.run(self.q_size)):
